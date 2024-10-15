@@ -9,8 +9,6 @@ import librosa
 import pretty_midi
 from monophonic import wave_to_midi
 
-
-
 def generate_metronome_sound(frequency=1000, duration=100):
     sample_rate = 44100
     t = np.linspace(0, duration / 1000, int(sample_rate * duration / 1000), endpoint=False)
