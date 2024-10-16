@@ -63,10 +63,10 @@ def collect_mid_files(source_dir, target_dir='data'):
                 shutil.copy2(source_file, destination_file)
                 print(f'Copié: {source_file} vers {destination_file}')
 
-# Fonction pour extraire les notes des fichiers MIDI
 def get_notes(data_dir='data'):
-    """Extrait les notes des fichiers MIDI dans le répertoire data."""
+    """Extrait les notes des fichiers MIDI dans le répertoire data, ainsi que leur tonalité (Majeur/Min)."""
     notes = []
+    tonalities = []  # Liste pour stocker les tonalités (0 = Mineur, 1 = Majeur)
     bad_files = []
 
     for file in os.listdir(data_dir):
@@ -78,32 +78,45 @@ def get_notes(data_dir='data'):
 
                 notes_to_parse = None
 
+                # Extraire les instruments, puis les notes à parser
                 try:
                     s2 = instrument.partitionByInstrument(midi)
                     notes_to_parse = s2.parts[0].recurse()
                 except:
                     notes_to_parse = midi.flat.notes
 
+                # Extraire les notes ou les accords du fichier MIDI
                 for element in notes_to_parse:
                     if isinstance(element, note.Note):
                         notes.append(str(element.pitch))
                     elif isinstance(element, chord.Chord):
                         # Représenter un accord par une notation unique
                         notes.append('.'.join(str(n) for n in element.normalOrder))
+                
+                # Extraire la tonalité à partir du nom du fichier
+                if '_Maj' in file:
+                    tonalities.append(1)  # Tonalité majeure
+                elif '_Min' in file:
+                    tonalities.append(0)  # Tonalité mineure
+                else:
+                    tonalities.append(1)  # Par défaut, considérons les fichiers sans info comme majeurs
+
             except Exception as e:
                 print(f"Erreur lors du traitement du fichier {file}: {e}")
                 bad_files.append(file_path)
 
-    # Sauvegarde des notes pour une utilisation future
+    # Sauvegarde des notes et des tonalités pour une utilisation future
     with open('notes.pkl', 'wb') as filepath:
         pickle.dump(notes, filepath)
+    with open('tonalities.pkl', 'wb') as filepath:
+        pickle.dump(tonalities, filepath)
 
     if bad_files:
         print("\nLes fichiers suivants n'ont pas pu être traités:")
         for bf in bad_files:
             print(bf)
 
-    return notes
+    return notes, tonalities
 
 # Fonction pour préparer les séquences pour le modèle
 def prepare_sequences(notes, n_vocab, sequence_length=100):
@@ -129,15 +142,15 @@ def prepare_sequences(notes, n_vocab, sequence_length=100):
     network_input = network_input / float(n_vocab)
     network_output = to_categorical(network_output, num_classes=n_vocab)
 
-    return (network_input, network_output)
+    return network_input, network_output
 
 # Fonction pour créer le modèle LSTM
 def create_network(network_input, n_vocab):
-    """Crée le modèle LSTM pour la génération de musique."""
+    """Crée le modèle LSTM pour la génération de musique avec la tonalité incluse."""
     model = Sequential()
     model.add(LSTM(
         512,
-        input_shape=(network_input.shape[1], network_input.shape[2]),
+        input_shape=(network_input.shape[1], network_input.shape[2]),  # Adaptation à la nouvelle forme d'entrée
         return_sequences=True
     ))
     model.add(Dropout(0.3))
@@ -152,7 +165,7 @@ def create_network(network_input, n_vocab):
     return model
 
 # Fonction pour entraîner le modèle
-def train(model, network_input, network_output, epochs=100, batch_size=64):
+def train(model, network_input, network_output, epochs=5, batch_size=1):
     """Entraîne le modèle."""
     model.fit(network_input, network_output, epochs=epochs, batch_size=batch_size)
     # Sauvegarder le modèle
@@ -161,15 +174,20 @@ def train(model, network_input, network_output, epochs=100, batch_size=64):
 # Fonction principale pour l'entraînement
 def train_network():
     """Prépare les données et entraîne le modèle."""
-    notes = get_notes()
-    n_vocab = len(set(notes))
+    notes, tonalities = get_notes()  # Récupérer les notes et les tonalités
+    n_vocab = len(set(notes))  # Nombre unique de notes
     network_input, network_output = prepare_sequences(notes, n_vocab)
+
+    # Si vous souhaitez également utiliser les tonalités pour l'entraînement, 
+    # vous pourriez les traiter ici. Par exemple, vous pouvez créer un 
+    # réseau de sortie qui inclut les tonalités.
+    
     model = create_network(network_input, n_vocab)
     train(model, network_input, network_output)
 
 # Fonction pour générer des notes
-def generate_notes(model, network_input, pitchnames, n_vocab, generate_length=500):
-    """Génère des notes à partir du modèle entraîné."""
+def generate_notes(model, network_input, pitchnames, n_vocab, tonality=1, temperature=1.0, generate_length=500):
+    """Génère des notes à partir du modèle entraîné en fonction d'une tonalité spécifique (Majeur ou Mineur)."""
     int_to_note = dict((number, note) for number, note in enumerate(pitchnames))
 
     # Choisir un point de départ aléatoire
@@ -181,13 +199,25 @@ def generate_notes(model, network_input, pitchnames, n_vocab, generate_length=50
     for note_index in range(generate_length):
         prediction_input = np.reshape(pattern, (1, pattern.shape[0], pattern.shape[1]))
         prediction = model.predict(prediction_input, verbose=0)
-        index = np.argmax(prediction)
+
+        # Appliquer la température pour ajuster la distribution
+        prediction = np.asarray(prediction).astype('float64')
+        prediction = np.log(prediction) / temperature  # Appliquer la température
+        prediction = np.exp(prediction)  # Convertir les log-probabilités
+        prediction /= np.sum(prediction)  # Normaliser pour obtenir une distribution de probabilité
+
+        # Choisir une note en fonction de la distribution
+        index = np.random.choice(range(len(prediction[0])), p=prediction[0])  
         result = int_to_note[index]
         prediction_output.append(result)
 
-        pattern = np.vstack((pattern[1:], [[index / float(n_vocab)]]))
+        # Mettre à jour le pattern, en ajoutant la tonalité
+        next_pattern = np.vstack((pattern[1:], [[index / float(n_vocab)]]))
+        next_pattern[-1] = tonality  # Ajouter la tonalité
+        pattern = next_pattern
 
     return prediction_output
+
 
 # Fonction pour convertir la sortie en MIDI
 def create_midi(prediction_output, output_file='output.mid'):
@@ -254,11 +284,11 @@ def enhance_melody(simple_midi_file, model_file='model.h5', output_file='enhance
 
     # Convertir les notes en entiers
     input_sequence = [note_to_int[char] for char in input_notes if char in note_to_int]
+    
     # S'assurer que la séquence est de la bonne longueur
     sequence_length = 100
     if len(input_sequence) < sequence_length:
-        # Remplir avec des zéros ou répéter le motif
-        input_sequence = [0]*(sequence_length - len(input_sequence)) + input_sequence
+        input_sequence = [0] * (sequence_length - len(input_sequence)) + input_sequence
     else:
         input_sequence = input_sequence[:sequence_length]
 
@@ -291,6 +321,8 @@ if __name__ == '__main__':
     parser.add_argument('--enhance', type=str, help='Améliorer une mélodie MIDI existante.')
     parser.add_argument('--source_dir', type=str, default='.', help='Répertoire source pour collecter les fichiers MIDI.')
     parser.add_argument('--output_file', type=str, default='output.mid', help='Nom du fichier MIDI de sortie.')
+    parser.add_argument('--tonality', type=int, choices=[0, 1], default=1, help='Tonalité : 0 pour Mineur, 1 pour Majeur.')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Température pour la génération de notes (valeur entre 0.0 et 1.0).')
 
     args = parser.parse_args()
 
@@ -306,9 +338,12 @@ if __name__ == '__main__':
         n_vocab = len(set(notes))
         pitchnames = sorted(set(item for item in notes))
         network_input, _ = prepare_sequences(notes, n_vocab)
-        prediction_output = generate_notes(model, network_input, pitchnames, n_vocab)
+
+        # Utiliser les paramètres de tonalité et de température pour générer des notes
+        prediction_output = generate_notes(model, network_input, pitchnames, n_vocab, args.tonality, args.temperature)
         create_midi(prediction_output, output_file=args.output_file)
     elif args.enhance:
         enhance_melody(args.enhance, output_file=args.output_file)
     else:
         print("Aucune action spécifiée. Utilisez --help pour afficher les options disponibles.")
+
