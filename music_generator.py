@@ -4,35 +4,16 @@ import pickle
 from music21 import converter, instrument, note, chord, stream, key as m21key
 import tensorflow as tf
 from tensorflow.keras.models import Model, load_model
-from tensorflow.keras.layers import Input, Dense, Dropout, Embedding, MultiHeadAttention, LayerNormalization, Add, GlobalAveragePooling1D
+from tensorflow.keras.layers import Input, Dense, Dropout, Embedding, MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D
 
-def get_notes_from_midi(midi_file):
-    """Extrait les notes et accords d'un fichier MIDI donné."""
-    notes = []
+# Définir les durées acceptables globalement
+acceptable_durations = [0.25, 0.5, 1.0, 2.0, 4.0]
 
-    midi = converter.parse(midi_file)
-    notes_to_parse = None
-
-    try:
-        s2 = instrument.partitionByInstrument(midi)
-        parts = s2.parts
-        notes_to_parse = parts[0].recurse()
-    except:
-        notes_to_parse = midi.flat.notes
-
-    for element in notes_to_parse:
-        if isinstance(element, note.Note):
-            notes.append(str(element.pitch))
-        elif isinstance(element, chord.Chord):
-            chord_str = '.'.join(str(p) for p in element.pitches)
-            notes.append(chord_str)
-
-    return notes
-
-def get_notes(data_dir='data'):
-    """Extrait les notes et leurs durées des fichiers MIDI dans un répertoire donné."""
+def get_notes_and_chords(data_dir='data'):
+    """Extrait les notes, les durées et les accords des fichiers MIDI dans un répertoire donné."""
     notes = []
     durations = []
+    chords_list = []
 
     for file in os.listdir(data_dir):
         if file.lower().endswith(('.mid', '.midi')):
@@ -47,59 +28,69 @@ def get_notes(data_dir='data'):
             except:
                 notes_to_parse = midi.flat.notes
 
+            prev_chord = None
             for element in notes_to_parse:
                 if isinstance(element, note.Note):
                     notes.append(str(element.pitch))
                     durations.append(element.duration.quarterLength)
+                    if prev_chord is not None:
+                        chords_list.append(prev_chord)
+                    else:
+                        chords_list.append('N')  # 'N' pour No Chord
+                    prev_chord = None
                 elif isinstance(element, chord.Chord):
                     chord_str = '.'.join(str(p) for p in element.pitches)
                     notes.append(chord_str)
                     durations.append(element.duration.quarterLength)
+                    prev_chord = chord_str
+                    chords_list.append(prev_chord)
+                else:
+                    # Si l'élément n'est ni une note ni un accord, on garde le dernier accord
+                    if prev_chord is not None:
+                        chords_list.append(prev_chord)
+                    else:
+                        chords_list.append('N')
 
-    # Sauvegarder les notes et les durées
+    # Sauvegarder les notes, les durées et les accords
     with open('notes.pkl', 'wb') as filepath:
         pickle.dump(notes, filepath)
     with open('durations.pkl', 'wb') as filepath:
         pickle.dump(durations, filepath)
+    with open('chords.pkl', 'wb') as filepath:
+        pickle.dump(chords_list, filepath)
 
-    return notes, durations
+    return notes, durations, chords_list
 
-def prepare_sequences(notes, durations, pitchnames, note_to_int, sequence_length=100):
+def prepare_sequences(notes, durations, chords_list, pitchnames, chordnames, durationnames, note_to_int, chord_to_int, duration_to_int, sequence_length=100):
     """Prépare les séquences pour l'entraînement du modèle Transformer."""
     network_input_notes = []
     network_input_durations = []
+    network_input_chords = []
     network_output_notes = []
     network_output_durations = []
+    network_output_chords = []
 
     for i in range(len(notes) - sequence_length):
         sequence_in_notes = notes[i:i + sequence_length]
         sequence_in_durations = durations[i:i + sequence_length]
+        sequence_in_chords = chords_list[i:i + sequence_length]
         sequence_out_note = notes[i + sequence_length]
         sequence_out_duration = durations[i + sequence_length]
+        sequence_out_chord = chords_list[i + sequence_length]
 
-        input_sequence_notes = [note_to_int[note] for note in sequence_in_notes]
-        input_sequence_durations = sequence_in_durations
+        input_sequence_notes = [note_to_int.get(note, 0) for note in sequence_in_notes]
+        input_sequence_durations = [duration_to_int.get(duration, 0) for duration in sequence_in_durations]
+        input_sequence_chords = [chord_to_int.get(chord, 0) for chord in sequence_in_chords]
 
         network_input_notes.append(input_sequence_notes)
         network_input_durations.append(input_sequence_durations)
-        network_output_notes.append(note_to_int[sequence_out_note])
-        network_output_durations.append(sequence_out_duration)
+        network_input_chords.append(input_sequence_chords)
+        network_output_notes.append(note_to_int.get(sequence_out_note, 0))
+        network_output_durations.append(duration_to_int.get(sequence_out_duration, 0))
+        network_output_chords.append(chord_to_int.get(sequence_out_chord, 0))
 
-    max_duration = np.max(durations)
-
-    # Conversion en tableaux NumPy avec types de données explicites
-    network_input_notes = np.array(network_input_notes, dtype=np.int32)
-    network_input_durations = np.array(network_input_durations, dtype=np.float32) / max_duration  # Normalisation
-    network_output_notes = np.array(network_output_notes, dtype=np.int32)
-    network_output_durations = np.array(network_output_durations, dtype=np.float32) / max_duration  # Normalisation
-
-    # Vérification des formes et des types de données
-    print(f"network_input_notes dtype: {network_input_notes.dtype}, shape: {network_input_notes.shape}")
-    print(f"network_input_durations dtype: {network_input_durations.dtype}, shape: {network_input_durations.shape}")
-    print(f"network_output_notes dtype: {network_output_notes.dtype}, shape: {network_output_notes.shape}")
-    print(f"network_output_durations dtype: {network_output_durations.dtype}, shape: {network_output_durations.shape}")
-
-    return network_input_notes, network_input_durations, network_output_notes, network_output_durations, max_duration
+    return (network_input_notes, network_input_durations, network_input_chords,
+            network_output_notes, network_output_durations, network_output_chords)
 
 def create_positional_encoding(seq_len, d_model):
     """Crée un encodage positionnel pour le Transformer."""
@@ -131,439 +122,306 @@ def transformer_encoder_layer(d_model, num_heads, dff, rate=0.1):
 
     return Model(inputs=inputs, outputs=out2)
 
-def create_transformer_model(n_vocab, max_seq_len, d_model=512, num_heads=12, dff=512, num_layers=32, rate=0.1, conditional=False):
+def create_transformer_model(n_vocab_notes, n_vocab_durations, n_vocab_chords, max_seq_len, d_model=256, num_heads=8, dff=512, num_layers=4, rate=0.1):
     """Crée et compile le modèle Transformer."""
     note_inputs = Input(shape=(max_seq_len,), name='note_inputs', dtype=tf.int32)
-    duration_inputs = Input(shape=(max_seq_len,), name='duration_inputs', dtype=tf.float32)
+    duration_inputs = Input(shape=(max_seq_len,), name='duration_inputs', dtype=tf.int32)
+    chord_inputs = Input(shape=(max_seq_len,), name='chord_inputs', dtype=tf.int32)
 
     # Embedding pour les notes
-    note_embedding = Embedding(input_dim=n_vocab, output_dim=d_model)(note_inputs)
+    note_embedding = Embedding(input_dim=n_vocab_notes, output_dim=d_model)(note_inputs)
     # Embedding pour les durées
-    duration_embedding = Dense(d_model)(tf.expand_dims(duration_inputs, -1))
+    duration_embedding = Embedding(input_dim=n_vocab_durations, output_dim=d_model)(duration_inputs)
+    # Embedding pour les accords
+    chord_embedding = Embedding(input_dim=n_vocab_chords, output_dim=d_model)(chord_inputs)
 
     # Somme des embeddings
-    embeddings = note_embedding + duration_embedding
+    embeddings = note_embedding + duration_embedding + chord_embedding
 
     # Ajout de l'encodage positionnel
     pos_encoding = create_positional_encoding(max_seq_len, d_model)
     embeddings += pos_encoding
+
+    inputs = [note_inputs, duration_inputs, chord_inputs]
 
     # Encodeur Transformer
     x = embeddings
     for _ in range(num_layers):
         x = transformer_encoder_layer(d_model, num_heads, dff, rate)(x)
 
-    # Si le modèle est conditionné par une mélodie, on ajoute une entrée supplémentaire
-    if conditional:
-        condition_inputs = Input(shape=(max_seq_len,), name='condition_inputs', dtype=tf.int32)
-        condition_embedding = Embedding(input_dim=n_vocab, output_dim=d_model)(condition_inputs)
-        x = Add()([x, condition_embedding])
-        inputs = [note_inputs, duration_inputs, condition_inputs]
-    else:
-        inputs = [note_inputs, duration_inputs]
-
     x = GlobalAveragePooling1D()(x)
     x = Dense(256, activation='relu')(x)
     x = Dropout(rate)(x)
 
     # Sortie pour les notes
-    notes_out = Dense(n_vocab, activation='softmax', name='notes')(x)
-    # Sortie pour les durées
-    durations_out = Dense(1, activation='linear', name='durations')(x)
+    notes_out = Dense(n_vocab_notes, activation='softmax', name='notes')(x)
+    # Sortie pour les durées (classification)
+    durations_out = Dense(n_vocab_durations, activation='softmax', name='durations')(x)
+    # Sortie pour les accords
+    chords_out = Dense(n_vocab_chords, activation='softmax', name='chords')(x)
 
-    model = Model(inputs=inputs, outputs=[notes_out, durations_out])
-    model.compile(loss={'notes': 'sparse_categorical_crossentropy', 'durations': 'mean_squared_error'}, optimizer='adam')
-
+    model = Model(inputs=inputs, outputs=[notes_out, durations_out, chords_out])
+    model.compile(loss={'notes': 'sparse_categorical_crossentropy',
+                        'durations': 'sparse_categorical_crossentropy',
+                        'chords': 'sparse_categorical_crossentropy'},
+                  optimizer='adam')
     return model
 
-def train_network(conditional=False):
-    """Entraîne le modèle Transformer sur les données extraites avec les durées."""
-    notes, durations = get_notes()
+def train_network():
+    """Entraîne le modèle Transformer sur les données extraites avec les durées et les accords."""
+    notes, durations_raw, chords_list = get_notes_and_chords()
     pitchnames = sorted(set(notes))
-    n_vocab = len(pitchnames)
+    chordnames = sorted(set(chords_list))
+
+    # Convertir les durées en catégories
+    durations = [min(acceptable_durations, key=lambda x: abs(x - d)) for d in durations_raw]
+    durationnames = sorted(set(acceptable_durations))
+
+    n_vocab_notes = len(pitchnames)
+    n_vocab_durations = len(durationnames)
+    n_vocab_chords = len(chordnames)
+
     note_to_int = dict((note, number) for number, note in enumerate(pitchnames))
+    duration_to_int = dict((duration, number) for number, duration in enumerate(durationnames))
+    chord_to_int = dict((chord, number) for number, chord in enumerate(chordnames))
 
     sequence_length = 100
-    network_input_notes, network_input_durations, network_output_notes, network_output_durations, max_duration = prepare_sequences(
-        notes, durations, pitchnames, note_to_int, sequence_length)
-
-    # Vérification des formes
-    print(f"Forme des entrées notes : {network_input_notes.shape}")
-    print(f"Forme des entrées durées : {network_input_durations.shape}")
-    print(f"Forme des sorties notes : {network_output_notes.shape}")
-    print(f"Forme des sorties durées : {network_output_durations.shape}")
+    (network_input_notes, network_input_durations, network_input_chords,
+     network_output_notes, network_output_durations, network_output_chords) = prepare_sequences(
+        notes, durations, chords_list, pitchnames, chordnames, durationnames, note_to_int, chord_to_int, duration_to_int, sequence_length)
 
     model = create_transformer_model(
-        n_vocab, 
-        max_seq_len=sequence_length, 
-        conditional=conditional
+        n_vocab_notes=n_vocab_notes,
+        n_vocab_durations=n_vocab_durations,
+        n_vocab_chords=n_vocab_chords,
+        max_seq_len=sequence_length
     )
 
     inputs = {
-        'note_inputs': network_input_notes,
-        'duration_inputs': network_input_durations
+        'note_inputs': np.array(network_input_notes),
+        'duration_inputs': np.array(network_input_durations),
+        'chord_inputs': np.array(network_input_chords)
     }
 
-    if conditional:
-        # Pour simplifier, utilisons les mêmes entrées comme condition
-        inputs['condition_inputs'] = network_input_notes
+    outputs = {
+        'notes': np.array(network_output_notes),
+        'durations': np.array(network_output_durations),
+        'chords': np.array(network_output_chords)
+    }
 
     # Entraînement du modèle
     model.fit(
         inputs,
-        {'notes': network_output_notes, 'durations': network_output_durations},
-        epochs=150,
+        outputs,
+        epochs=50,
         batch_size=16
     )
 
-    # Sauvegarder le modèle et le max_duration
+    # Sauvegarder le modèle complet
     model.save('model.h5')
-    with open('max_duration.pkl', 'wb') as f:
-        pickle.dump(max_duration, f)
 
-    # Sauvegarder int_to_note pour la génération
-    int_to_note = dict((number, note) for number, note in enumerate(pitchnames))
+    # Sauvegarder les mappings
+    with open('note_to_int.pkl', 'wb') as f:
+        pickle.dump(note_to_int, f)
     with open('int_to_note.pkl', 'wb') as f:
-        pickle.dump(int_to_note, f)
+        pickle.dump({v: k for k, v in note_to_int.items()}, f)
 
-def generate_notes(model, pitchnames, int_to_note, max_duration, key='C', temperature=1.0, num_measures=8, conditional=False):
-    """Génère une séquence de notes et de durées à partir du modèle entraîné."""
-    from music21 import note as m21note
+    with open('duration_to_int.pkl', 'wb') as f:
+        pickle.dump(duration_to_int, f)
+    with open('int_to_duration.pkl', 'wb') as f:
+        pickle.dump({v: k for k, v in duration_to_int.items()}, f)
 
-    # Obtenir la tonalité spécifiée
-    key_signature = m21key.Key(key)
-    allowed_pitches = [p.name for p in key_signature.pitches]
+    with open('chord_to_int.pkl', 'wb') as f:
+        pickle.dump(chord_to_int, f)
+    with open('int_to_chord.pkl', 'wb') as f:
+        pickle.dump({v: k for k, v in chord_to_int.items()}, f)
 
-    n_vocab = len(pitchnames)
+def generate_music(temperature=1.0, output_file='output.mid', num_measures=8, theory_weight=1.0):
+    """Génère une mélodie avec accompagnement d'accords en utilisant le modèle entraîné."""
+    # Charger les mappings
+    with open('int_to_note.pkl', 'rb') as f:
+        int_to_note = pickle.load(f)
+    with open('int_to_duration.pkl', 'rb') as f:
+        int_to_duration = pickle.load(f)
+    with open('int_to_chord.pkl', 'rb') as f:
+        int_to_chord = pickle.load(f)
+    pitchnames = list(int_to_note.values())
+    durationnames = list(int_to_duration.values())
+    chordnames = list(int_to_chord.values())
+    n_vocab_notes = len(pitchnames)
+    n_vocab_durations = len(durationnames)
+    n_vocab_chords = len(chordnames)
 
-    # Charger les séquences d'entrée
-    with open('notes.pkl', 'rb') as filepath:
-        notes = pickle.load(filepath)
-    with open('durations.pkl', 'rb') as filepath:
-        durations = pickle.load(filepath)
+    # Charger le modèle
+    model = load_model('model.h5')
 
-    note_to_int = dict((note, number) for number, note in enumerate(pitchnames))
+    # Charger les mappings inverses
+    with open('note_to_int.pkl', 'rb') as f:
+        note_to_int = pickle.load(f)
+    with open('duration_to_int.pkl', 'rb') as f:
+        duration_to_int = pickle.load(f)
+    with open('chord_to_int.pkl', 'rb') as f:
+        chord_to_int = pickle.load(f)
+
+    # Charger les données d'entraînement
+    with open('notes.pkl', 'rb') as f:
+        notes = pickle.load(f)
+    with open('durations.pkl', 'rb') as f:
+        durations_raw = pickle.load(f)
+    with open('chords.pkl', 'rb') as f:
+        chords_list = pickle.load(f)
+
+    durations = [min(acceptable_durations, key=lambda x: abs(x - d)) for d in durations_raw]
 
     sequence_length = 100
-    network_input_notes, network_input_durations, _, _, _ = prepare_sequences(
-        notes, durations, pitchnames, note_to_int, sequence_length)
+    (network_input_notes, network_input_durations, network_input_chords,
+     _, _, _) = prepare_sequences(
+        notes, durations, chords_list, pitchnames, chordnames, durationnames, note_to_int, chord_to_int, duration_to_int, sequence_length)
 
+    # Initialisation aléatoire
     start = np.random.randint(0, len(network_input_notes) - 1)
     pattern_notes = network_input_notes[start]
     pattern_durations = network_input_durations[start]
+    pattern_chords = network_input_chords[start]
 
-    prediction_output = []
+    prediction_output_notes = []
+    prediction_output_durations = []
+    prediction_output_chords = []
+
     total_duration = 0.0
-    measure_duration = 4.0  # Supposons une signature rythmique de 4/4
-
+    measure_duration = 4.0  # Signature rythmique 4/4
     desired_duration = num_measures * measure_duration
 
     while total_duration < desired_duration:
         inputs = {
             'note_inputs': np.array([pattern_notes], dtype=np.int32),
-            'duration_inputs': np.array([pattern_durations], dtype=np.float32)
+            'duration_inputs': np.array([pattern_durations], dtype=np.int32),
+            'chord_inputs': np.array([pattern_chords], dtype=np.int32)
         }
-
-        if conditional:
-            # Pour simplifier, utilisons le pattern_notes comme condition
-            inputs['condition_inputs'] = np.array([pattern_notes], dtype=np.int32)
 
         prediction = model.predict(inputs, verbose=0)
         prediction_notes = prediction[0][0]
         prediction_durations = prediction[1][0]
+        prediction_chords = prediction[2][0]
 
         # Application de la température pour les notes
         prediction_notes = np.log(prediction_notes + 1e-9) / temperature
-        exp_preds = np.exp(prediction_notes)
-        prediction_notes = exp_preds / np.sum(exp_preds)
+        exp_preds_notes = np.exp(prediction_notes)
+        prediction_notes = exp_preds_notes / np.sum(exp_preds_notes)
 
-        # Ajuster les probabilités en fonction de la tonalité
-        mask = np.ones(n_vocab)
-        for idx in range(n_vocab):
-            note_str = int_to_note[idx]
-            if '.' in note_str:
-                # Accord
-                notes_in_chord = note_str.split('.')
-                in_key = all(m21note.Pitch(n).name in allowed_pitches for n in notes_in_chord)
-            else:
-                in_key = m21note.Pitch(note_str).name in allowed_pitches
-            if not in_key:
-                mask[idx] *= 0.1  # Réduire la probabilité pour les notes hors tonalité
-        prediction_notes *= mask
-        prediction_notes /= np.sum(prediction_notes)
+        # Application de la température pour les durées
+        prediction_durations = np.log(prediction_durations + 1e-9) / temperature
+        exp_preds_durations = np.exp(prediction_durations)
+        prediction_durations = exp_preds_durations / np.sum(exp_preds_durations)
+
+        # Application de la température pour les accords
+        prediction_chords = np.log(prediction_chords + 1e-9) / temperature
+        exp_preds_chords = np.exp(prediction_chords)
+        prediction_chords = exp_preds_chords / np.sum(exp_preds_chords)
 
         # Sélection de l'index de la note
-        index = np.random.choice(range(n_vocab), p=prediction_notes)
-        result_note = int_to_note[index]
+        possible_indices = [idx for idx in range(n_vocab_notes) if '.' not in int_to_note[idx]]
+        prediction_notes_filtered = prediction_notes[possible_indices]
+        prediction_notes_filtered /= np.sum(prediction_notes_filtered)
+        index_note = np.random.choice(possible_indices, p=prediction_notes_filtered)
+        result_note = int_to_note[index_note]
 
-        # Récupération de la durée prédite
-        result_duration = prediction_durations * max_duration
+        # Sélection de l'index de la durée
+        index_duration = np.random.choice(range(n_vocab_durations), p=prediction_durations)
+        result_duration = int_to_duration[index_duration]
 
-        # Correction des durées négatives ou nulles
-        if result_duration <= 0:
-            result_duration = 0.25  # Valeur minimale par défaut
+        # Sélection de l'index de l'accord
+        index_chord = np.random.choice(range(n_vocab_chords), p=prediction_chords)
+        result_chord = int_to_chord[index_chord]
 
         # Ajouter à la sortie
-        prediction_output.append((result_note, result_duration))
+        prediction_output_notes.append((result_note, result_duration))
+        prediction_output_chords.append((result_chord, result_duration))
         total_duration += result_duration
 
         # Mise à jour du pattern
-        pattern_notes = np.append(pattern_notes[1:], index)
-        pattern_durations = np.append(pattern_durations[1:], result_duration / max_duration)
-
-    return prediction_output
-
-def create_midi(prediction_output, output_file='output.mid'):
-    """Convertit une séquence de notes et de durées en fichier MIDI."""
-    offset = 0
-    output_notes = []
-
-    # Définir les durées acceptables
-    acceptable_durations = [4.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25, 0.125, 0.0625]
-
-    for pattern, duration in prediction_output:
-        # Quantifier la durée à la valeur acceptable la plus proche
-        closest_duration = min(acceptable_durations, key=lambda x: abs(x - duration))
-
-        # S'assurer que la durée est positive
-        if closest_duration <= 0:
-            closest_duration = 0.25  # Valeur minimale par défaut
-
-        # Créer la note ou l'accord
-        if ('.' in pattern):
-            notes_in_chord = pattern.split('.')
-            notes = []
-            for current_note in notes_in_chord:
-                new_note = note.Note(current_note)
-                new_note.storedInstrument = instrument.Piano()
-                notes.append(new_note)
-            new_chord = chord.Chord(notes)
-            new_chord.offset = offset
-            new_chord.quarterLength = closest_duration
-            output_notes.append(new_chord)
-        else:
-            new_note = note.Note(pattern)
-            new_note.offset = offset
-            new_note.storedInstrument = instrument.Piano()
-            new_note.quarterLength = closest_duration
-            output_notes.append(new_note)
-        offset += closest_duration  # Incrémenter l'offset en fonction de la durée
-
-    midi_stream = stream.Stream(output_notes)
-    midi_stream.write('midi', fp=output_file)
-
-def get_notes_from_midi_with_durations(midi_file):
-    """Extrait les notes et leurs durées d'un fichier MIDI donné."""
-    notes = []
-    durations = []
-
-    midi = converter.parse(midi_file)
-    notes_to_parse = None
-
-    try:
-        s2 = instrument.partitionByInstrument(midi)
-        parts = s2.parts
-        notes_to_parse = parts[0].recurse()
-    except:
-        notes_to_parse = midi.flat.notes
-
-    for element in notes_to_parse:
-        if isinstance(element, note.Note):
-            notes.append(str(element.pitch))
-            durations.append(element.duration.quarterLength)
-        elif isinstance(element, chord.Chord):
-            chord_str = '.'.join(str(p) for p in element.pitches)
-            notes.append(chord_str)
-            durations.append(element.duration.quarterLength)
-
-    return notes, durations
-
-def generate_music(temperature=1.0, output_file='output.mid', key='C', num_measures=8, conditional=False):
-    """Génère une nouvelle mélodie et l'enregistre dans un fichier MIDI."""
-    with open('int_to_note.pkl', 'rb') as filepath:
-        int_to_note = pickle.load(filepath)
-    with open('max_duration.pkl', 'rb') as filepath:
-        max_duration = pickle.load(filepath)
-    pitchnames = list(int_to_note.values())
-    n_vocab = len(pitchnames)
-
-    model = load_model('model.h5', compile=False)
-    model.compile(loss={'notes': 'sparse_categorical_crossentropy', 'durations': 'mean_squared_error'}, optimizer='adam')
-
-    # Générer les notes
-    prediction_output = generate_notes(model, pitchnames, int_to_note, max_duration, key=key, temperature=temperature, num_measures=num_measures, conditional=conditional)
+        pattern_notes = np.append(pattern_notes[1:], index_note)
+        pattern_durations = np.append(pattern_durations[1:], index_duration)
+        pattern_chords = np.append(pattern_chords[1:], index_chord)
 
     # Créer le fichier MIDI
-    create_midi(prediction_output, output_file=output_file)
+    create_full_midi(prediction_output_chords, prediction_output_notes, output_file=output_file)
 
-def enhance_midi(input_midi_file, output_midi_file='enhanced_output.mid', key='C', num_measures=8, temperature=1.0, conditional=False):
-    """Améliore un fichier MIDI en y ajoutant une mélodie basée sur les notes existantes avec des durées variables."""
-    # Charger le modèle et les données nécessaires
-    with open('int_to_note.pkl', 'rb') as filepath:
-        int_to_note = pickle.load(filepath)
-    with open('max_duration.pkl', 'rb') as filepath:
-        max_duration = pickle.load(filepath)
-    pitchnames = list(int_to_note.values())
-    n_vocab = len(pitchnames)
-    note_to_int = dict((note, number) for number, note in enumerate(pitchnames))
-
-    # Extraire les notes et durées du fichier MIDI d'entrée
-    input_notes, input_durations = get_notes_from_midi_with_durations(input_midi_file)
-
-    # Vérifier si le fichier MIDI contient assez de notes
-    if len(input_notes) < 100:
-        print("Le fichier MIDI d'entrée ne contient pas assez de notes pour la condition.")
-        return
-
-    # Préparer les séquences pour la génération
-    sequence_length = 100
-    input_notes_seq = [note_to_int.get(n, 0) for n in input_notes]
-    input_durations_seq = input_durations
-
-    # Limiter la séquence à la longueur maximale
-    input_notes_seq = input_notes_seq[:sequence_length]
-    input_durations_seq = input_durations_seq[:sequence_length]
-    input_durations_seq = np.array(input_durations_seq, dtype=np.float32) / max_duration
-
-    # Charger le modèle
-    model = load_model('model.h5', compile=False)
-    model.compile(loss={'notes': 'sparse_categorical_crossentropy', 'durations': 'mean_squared_error'}, optimizer='adam')
-
-    # Générer une nouvelle mélodie conditionnée sur la mélodie d'entrée
-    prediction_output = []
-
-    pattern_notes = np.array(input_notes_seq, dtype=np.int32)
-    pattern_durations = np.array(input_durations_seq, dtype=np.float32)
-
-    total_duration = 0.0
-    measure_duration = 4.0
-    desired_duration = num_measures * measure_duration
-
-    while total_duration < desired_duration:
-        inputs = {
-            'note_inputs': np.array([pattern_notes], dtype=np.int32),
-            'duration_inputs': np.array([pattern_durations], dtype=np.float32)
-        }
-
-        if conditional:
-            inputs['condition_inputs'] = np.array([pattern_notes], dtype=np.int32)
-
-        prediction = model.predict(inputs, verbose=0)
-        prediction_notes = prediction[0][0]
-        prediction_durations = prediction[1][0]
-
-        # Application de la température pour les notes
-        prediction_notes = np.log(prediction_notes + 1e-9) / temperature
-        exp_preds = np.exp(prediction_notes)
-        prediction_notes = exp_preds / np.sum(exp_preds)
-
-        # Ajuster les probabilités en fonction de la tonalité
-        from music21 import note as m21note, key as m21key
-        key_signature = m21key.Key(key)
-        allowed_pitches = [p.name for p in key_signature.pitches]
-
-        mask = np.ones(n_vocab)
-        for idx in range(n_vocab):
-            note_str = int_to_note[idx]
-            if '.' in note_str:
-                notes_in_chord = note_str.split('.')
-                in_key = all(m21note.Pitch(n).name in allowed_pitches for n in notes_in_chord)
-            else:
-                in_key = m21note.Pitch(note_str).name in allowed_pitches
-            if not in_key:
-                mask[idx] *= 0.1
-        prediction_notes *= mask
-        prediction_notes /= np.sum(prediction_notes)
-
-        # Sélection de l'index de la note
-        index = np.random.choice(range(n_vocab), p=prediction_notes)
-        result_note = int_to_note[index]
-
-        # Récupération de la durée prédite
-        result_duration = prediction_durations * max_duration
-
-        if result_duration <= 0:
-            result_duration = 0.25
-
-        prediction_output.append((result_note, result_duration))
-        total_duration += result_duration
-
-        # Mise à jour du pattern
-        pattern_notes = np.append(pattern_notes[1:], index)
-        pattern_durations = np.append(pattern_durations[1:], result_duration / max_duration)
-
-    # Créer le flux MIDI de la nouvelle mélodie
-    output_notes = []
+def create_full_midi(chords_output, melody_output, output_file='output.mid'):
+    """Crée un fichier MIDI combinant les accords et la mélodie."""
     offset = 0
+    output_chords = []
+    output_melody = []
 
-    acceptable_durations = [4.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25, 0.125, 0.0625]
-
-    for pattern, duration in prediction_output:
-        closest_duration = min(acceptable_durations, key=lambda x: abs(x - duration))
-        if closest_duration <= 0:
-            closest_duration = 0.25
-
-        if ('.' in pattern):
-            notes_in_chord = pattern.split('.')
-            notes = []
-            for current_note in notes_in_chord:
-                new_note = note.Note(current_note)
-                new_note.storedInstrument = instrument.Violin()
+    # Création de la partie des accords
+    for chord_str, duration in chords_output:
+        if chord_str == 'N':
+            offset += duration
+            continue
+        notes_in_chord = chord_str.split('.')
+        notes = []
+        for note_str in notes_in_chord:
+            try:
+                new_note = note.Note(note_str)
+                new_note.storedInstrument = instrument.Piano()
                 notes.append(new_note)
+            except:
+                continue  # Ignorer les notes invalides
+        if notes:
             new_chord = chord.Chord(notes)
             new_chord.offset = offset
-            new_chord.quarterLength = closest_duration
-            output_notes.append(new_chord)
-        else:
-            new_note = note.Note(pattern)
+            new_chord.quarterLength = duration
+            output_chords.append(new_chord)
+        offset += duration
+
+    # Création de la partie de la mélodie
+    offset = 0
+    for note_str, duration in melody_output:
+        if '.' in note_str:
+            # Ignorer les accords dans la mélodie
+            continue
+        try:
+            new_note = note.Note(note_str)
             new_note.offset = offset
             new_note.storedInstrument = instrument.Violin()
-            new_note.quarterLength = closest_duration
-            output_notes.append(new_note)
-        offset += closest_duration
+            new_note.quarterLength = duration
+            output_melody.append(new_note)
+        except:
+            pass  # Ignorer les notes invalides
+        offset += duration
 
-    new_melody_stream = stream.Part(output_notes)
-    new_melody_stream.insert(0, instrument.Violin())
+    # Combinaison des deux parties
+    chords_part = stream.Part(output_chords)
+    chords_part.insert(0, instrument.Piano())
 
-    original_midi = converter.parse(input_midi_file)
-    if not isinstance(original_midi, stream.Part):
-        original_midi_part = stream.Part()
-        original_midi_part.append(original_midi)
-    else:
-        original_midi_part = original_midi
-
-    original_midi_part.insert(0, instrument.Piano())
+    melody_part = stream.Part(output_melody)
+    melody_part.insert(0, instrument.Violin())
 
     combined_score = stream.Score()
-    combined_score.insert(0, original_midi_part)
-    combined_score.insert(0, new_melody_stream)
+    combined_score.insert(0, chords_part)
+    combined_score.insert(0, melody_part)
 
-    combined_score.makeMeasures(inPlace=True)
-
-    combined_score.write('midi', fp=output_midi_file)
+    combined_score.write('midi', fp=output_file)
 
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Modèle Transformer pour la génération et l\'amélioration de mélodies MIDI.')
+    parser = argparse.ArgumentParser(description='Modèle Transformer pour la génération de mélodies avec accords.')
     parser.add_argument('--train', action='store_true', help='Entraîner le modèle Transformer.')
-    parser.add_argument('--generate', action='store_true', help='Générer une nouvelle mélodie.')
-    parser.add_argument('--enhance', action='store_true', help='Améliorer un fichier MIDI existant.')
-    parser.add_argument('--input_midi', type=str, help='Chemin du fichier MIDI d\'entrée pour l\'amélioration.')
+    parser.add_argument('--generate', action='store_true', help='Générer une nouvelle mélodie avec accords.')
     parser.add_argument('--output_file', type=str, default='output.mid', help='Nom du fichier MIDI de sortie.')
     parser.add_argument('--temperature', type=float, default=1.0, help='Température pour la génération de notes.')
-    parser.add_argument('--key', type=str, default='C', help='Tonalité pour la génération de la musique.')
     parser.add_argument('--measures', type=int, default=8, help='Nombre de mesures à générer.')
-    parser.add_argument('--conditional', action='store_true', help='Utiliser le modèle conditionné par une mélodie.')
+    parser.add_argument('--theory_weight', type=float, default=1.0, help='Poids du respect de la théorie musicale.')
 
     args = parser.parse_args()
 
     if args.train:
-        train_network(conditional=args.conditional)
+        train_network()
     if args.generate:
-        generate_music(temperature=args.temperature, output_file=args.output_file, key=args.key, num_measures=args.measures, conditional=args.conditional)
-    if args.enhance:
-        if args.input_midi:
-            enhance_midi(input_midi_file=args.input_midi, output_midi_file=args.output_file, key=args.key, num_measures=args.measures, temperature=args.temperature, conditional=args.conditional)
-        else:
-            print("Veuillez fournir le chemin du fichier MIDI d'entrée avec l'argument --input_midi.")
+        generate_music(
+            temperature=args.temperature,
+            output_file=args.output_file,
+            num_measures=args.measures,
+            theory_weight=args.theory_weight
+        )
