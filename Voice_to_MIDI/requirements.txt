@@ -1,0 +1,17 @@
+sounddevice
+numpy
+mido
+scipy
+librosa
+pretty_midi
+midiutil
+torch
+huggingface_hub
+safetensors
+peft
+Pillow
+midi2audio
+pyfluidsynth
+streamlit-webrtc
+streamlit
+torchaudio

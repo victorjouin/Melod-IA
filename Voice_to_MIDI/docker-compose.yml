@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  melod-ia-app:
+    build: .
+    container_name: melod-ia-app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
